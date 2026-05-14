@@ -33,6 +33,76 @@ const (
 	kiroPlaceholderToolName = "no_tool_available"
 )
 
+// fullKiroModelMapping normalizes model name variants to canonical dotted versions.
+// For example claude-sonnet-4-5 → claude-sonnet-4.5 and claude-opus-4-5-20251101 → claude-opus-4.5.
+// This mirrors the AIClient2API FULL_MODEL_MAPPING behavior.
+var fullKiroModelMapping = map[string]string{
+	"claude-haiku-4-5":           "claude-haiku-4.5",
+	"claude-haiku-4-5-20251001":  "claude-haiku-4.5",
+	"claude-opus-4-7":            "claude-opus-4.7",
+	"claude-opus-4-6":            "claude-opus-4.6",
+	"claude-opus-4-5":            "claude-opus-4.5",
+	"claude-opus-4-5-20251101":   "claude-opus-4.5",
+	"claude-sonnet-4-6":          "claude-sonnet-4.6",
+	"claude-sonnet-4-5":          "claude-sonnet-4.5",
+	"claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+}
+
+// kiroToolNameMap tracks shortened-to-original tool name mappings for bidirectional
+// restoration. The Kiro backend has a 64-char tool name limit, so names are shortened
+// before sending and restored in the response to match the caller's original definitions.
+type kiroToolNameMap struct {
+	shortToOrig map[string]string
+}
+
+func newKiroToolNameMap() *kiroToolNameMap {
+	return &kiroToolNameMap{shortToOrig: make(map[string]string)}
+}
+
+// Register records a name that would be shortened, associating the shortened form
+// with the original. Names already within the length limit are not tracked.
+func (m *kiroToolNameMap) Register(name string) {
+	if m == nil || len(name) <= kiroMaxToolNameLength {
+		return
+	}
+	short := shortenKiroToolName(name)
+	if short != name {
+		m.shortToOrig[short] = name
+	}
+}
+
+// Restore returns the original name for a shortened form, or the input unchanged
+// if no mapping exists.
+func (m *kiroToolNameMap) Restore(name string) string {
+	if m == nil || name == "" {
+		return name
+	}
+	if orig, ok := m.shortToOrig[name]; ok {
+		return orig
+	}
+	return name
+}
+
+// buildKiroToolNameMapFromClaudeBody scans a Claude-format request body for tool
+// definitions and tool_use references, registering each name in the map.
+func buildKiroToolNameMapFromClaudeBody(body []byte) *kiroToolNameMap {
+	tm := newKiroToolNameMap()
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		tm.Register(tool.Get("name").String())
+	}
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		content := msg.Get("content")
+		if content.IsArray() {
+			for _, part := range content.Array() {
+				if part.Get("type").String() == "tool_use" {
+					tm.Register(part.Get("name").String())
+				}
+			}
+		}
+	}
+	return tm
+}
+
 // KiroExecutor proxies Claude-compatible requests to the Kiro/Amazon Q assistant endpoint.
 type KiroExecutor struct {
 	cfg      *config.Config
@@ -68,7 +138,8 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	if err != nil {
 		return resp, err
 	}
-	kiroBody, err := buildKiroRequest(bodyForUpstream, baseModel, auth)
+	kiroToolMap := buildKiroToolNameMapFromClaudeBody(bodyForUpstream)
+	kiroBody, err := buildKiroRequest(bodyForUpstream, baseModel, auth, kiroToolMap)
 	if err != nil {
 		return resp, err
 	}
@@ -96,7 +167,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 
-	claudePayload, usage := kiroResponseToClaude(data, baseModel)
+	claudePayload, usage := kiroResponseToClaude(data, baseModel, kiroToolMap)
 	reporter.Publish(ctx, usage)
 	var param any
 	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, opts.OriginalRequest, bodyForTranslation, claudePayload, &param)
@@ -121,7 +192,8 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	if err != nil {
 		return nil, err
 	}
-	kiroBody, err := buildKiroRequest(bodyForUpstream, baseModel, auth)
+	kiroToolMap := buildKiroToolNameMapFromClaudeBody(bodyForUpstream)
+	kiroBody, err := buildKiroRequest(bodyForUpstream, baseModel, auth, kiroToolMap)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +238,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			}
 		}()
 		var param any
-		streamKiroAsClaude(ctx, decodedBody, func(line []byte) bool {
+		streamKiroAsClaude(ctx, decodedBody, kiroToolMap, func(line []byte) bool {
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseClaudeStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
@@ -320,7 +392,7 @@ type kiroToolUse struct {
 	ToolUseID string `json:"toolUseId"`
 }
 
-func buildKiroRequest(claudeBody []byte, model string, auth *cliproxyauth.Auth) ([]byte, error) {
+func buildKiroRequest(claudeBody []byte, model string, auth *cliproxyauth.Auth, toolMap *kiroToolNameMap) ([]byte, error) {
 	root := gjson.ParseBytes(claudeBody)
 	messages := root.Get("messages").Array()
 	if len(messages) == 0 {
@@ -510,14 +582,14 @@ func buildKiroTools(tools gjson.Result) []map[string]any {
 	return out
 }
 
-func kiroResponseToClaude(data []byte, model string) ([]byte, usage.Detail) {
+func kiroResponseToClaude(data []byte, model string, toolMap *kiroToolNameMap) ([]byte, usage.Detail) {
 	text, toolUses := parseKiroContentAndTools(data)
 	content := []map[string]any{}
 	if strings.TrimSpace(text) != "" {
 		content = append(content, map[string]any{"type": "text", "text": text})
 	}
 	for _, tu := range toolUses {
-		content = append(content, map[string]any{"type": "tool_use", "id": tu.ToolUseID, "name": tu.Name, "input": tu.Input})
+		content = append(content, map[string]any{"type": "tool_use", "id": tu.ToolUseID, "name": toolMap.Restore(tu.Name), "input": tu.Input})
 	}
 	if len(content) == 0 {
 		content = append(content, map[string]any{"type": "text", "text": string(data)})
@@ -544,7 +616,7 @@ type kiroStreamState struct {
 	toolBlockIdx int
 }
 
-func streamKiroAsClaude(ctx context.Context, r io.Reader, emit func([]byte) bool) {
+func streamKiroAsClaude(ctx context.Context, r io.Reader, toolMap *kiroToolNameMap, emit func([]byte) bool) {
 	model := kiroDefaultModel
 	id := "msg_" + uuid.NewString()
 	st := &kiroStreamState{}
@@ -562,7 +634,7 @@ func streamKiroAsClaude(ctx context.Context, r io.Reader, emit func([]byte) bool
 		n, readErr := r.Read(buf)
 		if n > 0 {
 			remainder = append(remainder, buf[:n]...)
-			remainder = parseKiroStreamChunk(remainder, st, emit)
+			remainder = parseKiroStreamChunk(remainder, st, toolMap, emit)
 		}
 		if readErr != nil {
 			break
@@ -611,7 +683,7 @@ func closeKiroToolBlock(st *kiroStreamState, emit func([]byte) bool) {
 	st.toolBlockIdx = -1
 }
 
-func parseKiroStreamChunk(data []byte, st *kiroStreamState, emit func([]byte) bool) []byte {
+func parseKiroStreamChunk(data []byte, st *kiroStreamState, toolMap *kiroToolNameMap, emit func([]byte) bool) []byte {
 	if len(data) == 0 {
 		return data
 	}
@@ -679,7 +751,7 @@ func parseKiroStreamChunk(data []byte, st *kiroStreamState, emit func([]byte) bo
 				return nil
 			}
 		} else if ev.Name != nil && ev.ToolUseID != nil {
-			openKiroToolBlock(st, emit, *ev.Name, *ev.ToolUseID, normalizeKiroInput(ev.Input))
+			openKiroToolBlock(st, emit, toolMap.Restore(*ev.Name), *ev.ToolUseID, normalizeKiroInput(ev.Input))
 		} else if ev.Stop != nil && *ev.Stop {
 			closeKiroToolBlock(st, emit)
 		}
@@ -848,6 +920,9 @@ func kiroGenerateURL(a *cliproxyauth.Auth) string {
 }
 func kiroModelName(model string) string {
 	if v := strings.TrimSpace(thinking.ParseSuffix(model).ModelName); v != "" {
+		if mapped, ok := fullKiroModelMapping[v]; ok {
+			return mapped
+		}
 		return v
 	}
 	return kiroDefaultModel

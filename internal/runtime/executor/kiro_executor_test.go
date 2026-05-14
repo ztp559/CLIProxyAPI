@@ -183,7 +183,7 @@ func TestKiroProfileARN_Empty(t *testing.T) {
 func TestBuildKiroRequest_BasicUserMessage(t *testing.T) {
 	payload := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":[{"type":"text","text":"Hello, Kiro!"}]}]}`
 	auth := testKiroAuth(t, "tok", "rt", "")
-	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth)
+	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth, nil)
 	if err != nil {
 		t.Fatalf("buildKiroRequest() error = %v", err)
 	}
@@ -219,7 +219,7 @@ func TestBuildKiroRequest_BasicUserMessage(t *testing.T) {
 func TestBuildKiroRequest_WithSystemPrompt(t *testing.T) {
 	payload := `{"model":"claude-sonnet-4","system":"You are a helpful assistant.","messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]}`
 	auth := testKiroAuth(t, "tok", "rt", "")
-	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth)
+	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth, nil)
 	if err != nil {
 		t.Fatalf("buildKiroRequest() error = %v", err)
 	}
@@ -240,7 +240,7 @@ func TestBuildKiroRequest_WithProfileARN(t *testing.T) {
 	payload := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":[{"type":"text","text":"Hi"}]}]}`
 	auth := testKiroAuth(t, "tok", "rt", "")
 	auth.Metadata["profile_arn"] = "arn:aws:iam::12345:role/test"
-	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth)
+	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth, nil)
 	if err != nil {
 		t.Fatalf("buildKiroRequest() error = %v", err)
 	}
@@ -257,7 +257,7 @@ func TestBuildKiroRequest_WithProfileARN(t *testing.T) {
 func TestBuildKiroRequest_WithTools(t *testing.T) {
 	payload := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":[{"type":"text","text":"List files"}]}],"tools":[{"name":"bash","description":"Run bash commands","input_schema":{"type":"object","properties":{}}}]}`
 	auth := testKiroAuth(t, "tok", "rt", "")
-	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth)
+	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth, nil)
 	if err != nil {
 		t.Fatalf("buildKiroRequest() error = %v", err)
 	}
@@ -290,7 +290,7 @@ func TestBuildKiroRequest_WithTools(t *testing.T) {
 func TestBuildKiroRequest_WithHistory(t *testing.T) {
 	payload := `{"model":"claude-sonnet-4","messages":[{"role":"user","content":[{"type":"text","text":"First"}]},{"role":"assistant","content":[{"type":"text","text":"Response to first"}]},{"role":"user","content":[{"type":"text","text":"Second"}]}]}`
 	auth := testKiroAuth(t, "tok", "rt", "")
-	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth)
+	body, err := buildKiroRequest([]byte(payload), "claude-sonnet-4", auth, nil)
 	if err != nil {
 		t.Fatalf("buildKiroRequest() error = %v", err)
 	}
@@ -311,7 +311,7 @@ func TestBuildKiroRequest_WithHistory(t *testing.T) {
 
 func TestKiroResponseToClaude_Basic(t *testing.T) {
 	data := []byte(`{"content":"Hello from Kiro!","toolUses":[]}`)
-	result, usage := kiroResponseToClaude(data, "claude-sonnet-4")
+	result, usage := kiroResponseToClaude(data, "claude-sonnet-4", nil)
 	var msg map[string]any
 	if err := json.Unmarshal(result, &msg); err != nil {
 		t.Fatalf("json.Unmarshal error = %v", err)
@@ -482,6 +482,112 @@ func TestKiroExecutor_ExecuteStream_CompactAltError(t *testing.T) {
 	_, err := e.ExecuteStream(context.Background(), nil, cliproxyexecutor.Request{}, cliproxyexecutor.Options{Alt: "responses/compact"})
 	if err == nil {
 		t.Fatal("expected error for responses/compact")
+	}
+}
+
+func TestKiroToolNameMap_RegisterShortName(t *testing.T) {
+	tm := newKiroToolNameMap()
+	tm.Register("bash")
+	if len(tm.shortToOrig) != 0 {
+		t.Error("short names should not be registered")
+	}
+}
+
+func TestKiroToolNameMap_RegisterAndRestore(t *testing.T) {
+	tm := newKiroToolNameMap()
+	longName := ""
+	for i := 0; i < 100; i++ {
+		longName += "x"
+	}
+	tm.Register(longName)
+	short := shortenKiroToolName(longName)
+	if got := tm.Restore(short); got != longName {
+		t.Errorf("Restore(%q) = %q, want %q", short, got, longName)
+	}
+}
+
+func TestKiroToolNameMap_RestoreUnknown(t *testing.T) {
+	tm := newKiroToolNameMap()
+	if got := tm.Restore("unknown"); got != "unknown" {
+		t.Errorf("Restore(unknown) = %q, want %q", got, "unknown")
+	}
+}
+
+func TestKiroToolNameMap_NilSafe(t *testing.T) {
+	var tm *kiroToolNameMap
+	if got := tm.Restore("something"); got != "something" {
+		t.Errorf("nil Restore = %q, want %q", got, "something")
+	}
+}
+
+func TestBuildKiroToolNameMapFromClaudeBody(t *testing.T) {
+	body := []byte(`{"tools":[{"name":"very_long_tool_name_that_exceeds_64_characters_abcdefghijklmnop"}],"messages":[{"role":"assistant","content":[{"type":"tool_use","name":"another_very_long_tool_name_that_also_exceeds_64_characters_qrstuvwxyz"}]}]}`)
+	tm := buildKiroToolNameMapFromClaudeBody(body)
+	short1 := shortenKiroToolName("very_long_tool_name_that_exceeds_64_characters_abcdefghijklmnop")
+	short2 := shortenKiroToolName("another_very_long_tool_name_that_also_exceeds_64_characters_qrstuvwxyz")
+	if got := tm.Restore(short1); got != "very_long_tool_name_that_exceeds_64_characters_abcdefghijklmnop" {
+		t.Errorf("tool Restore = %q, want original", got)
+	}
+	if got := tm.Restore(short2); got != "another_very_long_tool_name_that_also_exceeds_64_characters_qrstuvwxyz" {
+		t.Errorf("tool_use Restore = %q, want original", got)
+	}
+}
+
+func TestKiroModelName_NormalizesDashVersion(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"claude-sonnet-4-5", "claude-sonnet-4.5"},
+		{"claude-sonnet-4-6", "claude-sonnet-4.6"},
+		{"claude-opus-4-5", "claude-opus-4.5"},
+		{"claude-opus-4-6", "claude-opus-4.6"},
+		{"claude-opus-4-7", "claude-opus-4.7"},
+		{"claude-haiku-4-5", "claude-haiku-4.5"},
+		{"claude-opus-4-5-20251101", "claude-opus-4.5"},
+		{"claude-sonnet-4-5-20250929", "claude-sonnet-4.5"},
+		{"claude-haiku-4-5-20251001", "claude-haiku-4.5"},
+		{"claude-sonnet-4", "claude-sonnet-4"},
+		{"", "claude-sonnet-4.5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := kiroModelName(tt.input); got != tt.want {
+				t.Errorf("kiroModelName(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestKiroResponseToClaude_RestoresToolNames(t *testing.T) {
+	tm := newKiroToolNameMap()
+	origName := ""
+	for i := 0; i < 100; i++ {
+		origName += "x"
+	}
+	tm.Register(origName)
+	shortName := shortenKiroToolName(origName)
+	data := []byte(`{"content":"Using tools","toolUses":[{"name":"` + shortName + `","toolUseId":"tu123","input":{"cmd":"ls"}}]}`)
+	result, _ := kiroResponseToClaude(data, "claude-sonnet-4", tm)
+	var msg map[string]any
+	if err := json.Unmarshal(result, &msg); err != nil {
+		t.Fatalf("json.Unmarshal error = %v", err)
+	}
+	content, _ := msg["content"].([]any)
+	found := false
+	for _, c := range content {
+		block, _ := c.(map[string]any)
+		if block["type"] == "tool_use" {
+			name, _ := block["name"].(string)
+			if name == origName {
+				found = true
+			} else {
+				t.Errorf("tool_use name = %q, want original %q", name, origName)
+			}
+		}
+	}
+	if !found {
+		t.Error("no tool_use block found with restored name")
 	}
 }
 
