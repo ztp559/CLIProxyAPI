@@ -802,6 +802,7 @@ func applyKiroHeaders(req *http.Request, auth *cliproxyauth.Auth, token string) 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", kiroauth.KiroUserAgent)
 	req.Header.Set("amz-sdk-invocation-id", uuid.NewString())
+	req.Header.Set("amz-sdk-request", "attempt=1; max=3")
 	if auth != nil {
 		util.ApplyCustomHeadersFromAttrs(req, auth.Attributes)
 	}
