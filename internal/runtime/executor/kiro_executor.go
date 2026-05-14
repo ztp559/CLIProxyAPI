@@ -158,6 +158,29 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		return resp, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+	// On 401 (Unauthorized) attempt to refresh the token and retry once
+	if httpResp.StatusCode == http.StatusUnauthorized {
+		_ = httpResp.Body.Close()
+		refreshed, refreshErr := e.Refresh(ctx, auth)
+		if refreshErr != nil {
+			return resp, statusErr{code: http.StatusUnauthorized, msg: "kiro: token refresh failed: " + refreshErr.Error()}
+		}
+		newToken, _, _, _ := kiroCreds(refreshed)
+		httpReqRetry, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroBody))
+		if retryErr != nil {
+			return resp, retryErr
+		}
+		applyKiroHeaders(httpReqRetry, refreshed, newToken)
+		recordKiroRequest(ctx, e.cfg, httpReqRetry, kiroBody, e.Identifier(), refreshed)
+		httpResp, err = helps.NewUtlsHTTPClient(e.cfg, refreshed, 0).Do(httpReqRetry)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return resp, err
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	}
+
 	data, err := readKiroResponseBody(ctx, e.cfg, httpResp)
 	if err != nil {
 		return resp, err
@@ -212,6 +235,29 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		return nil, err
 	}
 	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+
+	// On 401 (Unauthorized) attempt to refresh the token and retry once
+	if httpResp.StatusCode == http.StatusUnauthorized {
+		_ = httpResp.Body.Close()
+		refreshed, refreshErr := e.Refresh(ctx, auth)
+		if refreshErr != nil {
+			return nil, statusErr{code: http.StatusUnauthorized, msg: "kiro: token refresh failed: " + refreshErr.Error()}
+		}
+		newToken, _, _, _ := kiroCreds(refreshed)
+		httpReqRetry, retryErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(kiroBody))
+		if retryErr != nil {
+			return nil, retryErr
+		}
+		applyKiroHeaders(httpReqRetry, refreshed, newToken)
+		recordKiroRequest(ctx, e.cfg, httpReqRetry, kiroBody, e.Identifier(), refreshed)
+		httpResp, err = helps.NewUtlsHTTPClient(e.cfg, refreshed, 0).Do(httpReqRetry)
+		if err != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, err)
+			return nil, err
+		}
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	}
+
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		data, readErr := readKiroResponseBody(ctx, e.cfg, httpResp)
 		if readErr != nil {
@@ -610,10 +656,11 @@ type kiroStreamEvent struct {
 }
 
 type kiroStreamState struct {
-	blockIndex   int
-	textOpened   bool
-	toolOpened   bool
-	toolBlockIdx int
+	blockIndex      int
+	textOpened      bool
+	toolOpened      bool
+	toolBlockIdx    int
+	lastContentText string
 }
 
 func streamKiroAsClaude(ctx context.Context, r io.Reader, toolMap *kiroToolNameMap, emit func([]byte) bool) {
@@ -746,6 +793,10 @@ func parseKiroStreamChunk(data []byte, st *kiroStreamState, toolMap *kiroToolNam
 		}
 
 		if ev.Content != nil && *ev.Content != "" {
+			if *ev.Content == st.lastContentText {
+				continue
+			}
+			st.lastContentText = *ev.Content
 			openKiroTextBlock(st, emit)
 			if !emit([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{"type": "content_block_delta", "index": st.blockIndex, "delta": map[string]any{"type": "text_delta", "text": *ev.Content}}) + "\n")) {
 				return nil
