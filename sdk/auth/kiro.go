@@ -17,13 +17,23 @@ import (
 
 type KiroAuthenticator struct {
 	CallbackPort int
+	ProviderKey  string
 }
 
 func NewKiroAuthenticator() *KiroAuthenticator {
-	return &KiroAuthenticator{CallbackPort: 19876}
+	return &KiroAuthenticator{CallbackPort: 19876, ProviderKey: kiro.ProviderKey}
 }
 
-func (a *KiroAuthenticator) Provider() string { return kiro.ProviderKey }
+func NewKiroLegacyAuthenticator() *KiroAuthenticator {
+	return &KiroAuthenticator{CallbackPort: 19876, ProviderKey: kiro.LegacyProviderKey}
+}
+
+func (a *KiroAuthenticator) Provider() string {
+	if a != nil && strings.TrimSpace(a.ProviderKey) != "" {
+		return strings.ToLower(strings.TrimSpace(a.ProviderKey))
+	}
+	return kiro.ProviderKey
+}
 
 func (a *KiroAuthenticator) RefreshLead() *time.Duration { return new(5 * time.Minute) }
 

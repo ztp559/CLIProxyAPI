@@ -117,6 +117,7 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewCodexAuthenticator(),
 		sdkAuth.NewClaudeAuthenticator(),
 		sdkAuth.NewKiroAuthenticator(),
+		sdkAuth.NewKiroLegacyAuthenticator(),
 	)
 }
 
@@ -432,6 +433,9 @@ func (s *Service) ensureExecutorsForAuthWithMode(a *coreauth.Auth, forceReplace 
 		s.coreManager.RegisterExecutor(executor.NewAntigravityExecutor(s.cfg))
 	case "claude":
 		s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
+	case "kiro", "claude-kiro-oauth":
+		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg, "kiro"))
+		s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg, "claude-kiro-oauth"))
 	case "kimi":
 		s.coreManager.RegisterExecutor(executor.NewKimiExecutor(s.cfg))
 	default:
@@ -581,6 +585,8 @@ func (s *Service) registerHomeExecutors() {
 	// requiring any local auth-dir credentials.
 	s.coreManager.RegisterExecutor(executor.NewCodexAutoExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewClaudeExecutor(s.cfg))
+	s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg, "kiro"))
+	s.coreManager.RegisterExecutor(executor.NewKiroExecutor(s.cfg, "claude-kiro-oauth"))
 	s.coreManager.RegisterExecutor(executor.NewGeminiExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewGeminiVertexExecutor(s.cfg))
 	s.coreManager.RegisterExecutor(executor.NewGeminiCLIExecutor(s.cfg))
@@ -1124,6 +1130,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 				excluded = entry.ExcludedModels
 			}
 		}
+		models = applyExcludedModels(models, excluded)
+	case "kiro", "claude-kiro-oauth":
+		models = registry.GetClaudeModels()
 		models = applyExcludedModels(models, excluded)
 	case "codex":
 		codexPlanType := ""
