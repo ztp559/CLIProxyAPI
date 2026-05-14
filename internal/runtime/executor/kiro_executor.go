@@ -233,7 +233,12 @@ func (e *KiroExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth,
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("claude")
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
-	return cliproxyexecutor.Response{Payload: sdktranslator.TranslateTokenCount(ctx, to, from, int64(countKiroApproxTokens(body)), opts.OriginalRequest)}, nil
+	count := int64(countKiroApproxTokens(body))
+	payload := sdktranslator.TranslateTokenCount(ctx, to, from, count, opts.OriginalRequest)
+	if len(payload) == 0 {
+		payload = []byte(fmt.Sprintf(`{"input_tokens":%d}`, count))
+	}
+	return cliproxyexecutor.Response{Payload: payload}, nil
 }
 
 func (e *KiroExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
