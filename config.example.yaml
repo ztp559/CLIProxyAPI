@@ -224,6 +224,28 @@ nonstream-keepalive-interval: 0
 #     experimental-cch-signing: false # optional: default is false; when true, sign the final /v1/messages body using the current Claude Code cch algorithm
 #                                     # keep this disabled unless you explicitly need the behavior, so upstream seed changes fall back to legacy proxy behavior
 
+# Kiro (Amazon Q) OAuth credentials
+# kiro-oauth:
+#   - auth-method: "google"            # OAuth provider: "google" or "github"
+#     region: "us-east-1"              # AWS region for the Kiro backend
+#     prefix: "kiro"                   # optional: require calls like "kiro/claude-sonnet-4" to target this credential
+#     models:                          # optional: map client aliases to upstream Kiro model IDs
+#       - name: "claude-sonnet-4.5"    # upstream model identifier
+#         alias: "claude-sonnet-latest"# client alias
+#   - auth-method: "github"
+#     region: "us-west-2"
+#     prefix: "kiro-github"
+#     models:
+#       - name: "claude-sonnet-4.5"
+#         alias: "claude-sonnet-latest"
+
+# Kiro supports social OAuth login (Google/GitHub) via the built-in authenticator.
+# Use `hermes auth login kiro` to start the OAuth flow, or
+# `hermes auth login claude-kiro-oauth` for legacy compatibility.
+# OAuth tokens are automatically refreshed every 5 minutes.
+# The Kiro backend endpoint is: https://q.<region>.amazonaws.com/generateAssistantResponse
+# Supported regions: us-east-1 (default), us-west-2, eu-west-1, etc.
+
 # Default headers for Claude API requests. Update when Claude Code releases new versions.
 # In legacy mode, user-agent/package-version/runtime-version/timeout are used as fallbacks
 # when the client omits them, while OS/arch remain runtime-derived. When

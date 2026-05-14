@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -524,27 +523,182 @@ func kiroResponseToClaude(data []byte, model string) ([]byte, usage.Detail) {
 	return raw, usageDetail
 }
 
+type kiroStreamEvent struct {
+	Content             *string         `json:"content,omitempty"`
+	Name                *string         `json:"name,omitempty"`
+	ToolUseID           *string         `json:"toolUseId,omitempty"`
+	Input               json.RawMessage `json:"input,omitempty"`
+	Stop                *bool           `json:"stop,omitempty"`
+	ContextUsagePercent *float64        `json:"contextUsagePercentage,omitempty"`
+}
+
+type kiroStreamState struct {
+	blockIndex   int
+	textOpened   bool
+	toolOpened   bool
+	toolBlockIdx int
+}
+
 func streamKiroAsClaude(ctx context.Context, r io.Reader, emit func([]byte) bool) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(nil, 52_428_800)
 	model := kiroDefaultModel
 	id := "msg_" + uuid.NewString()
+	st := &kiroStreamState{}
+
 	emit([]byte("event: message_start\ndata: " + mustJSON(map[string]any{"type": "message_start", "message": map[string]any{"id": id, "type": "message", "role": "assistant", "model": model, "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}}) + "\n"))
-	emit([]byte("event: content_block_start\ndata: " + mustJSON(map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}}) + "\n"))
-	for scanner.Scan() {
-		chunk := scanner.Bytes()
-		text, _ := parseKiroContentAndTools(chunk)
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		if !emit([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": text}}) + "\n")) {
+
+	buf := make([]byte, 32768)
+	remainder := []byte{}
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		default:
+		}
+		n, readErr := r.Read(buf)
+		if n > 0 {
+			remainder = append(remainder, buf[:n]...)
+			remainder = parseKiroStreamChunk(remainder, st, emit)
+		}
+		if readErr != nil {
+			break
 		}
 	}
-	emit([]byte("event: content_block_stop\ndata: " + mustJSON(map[string]any{"type": "content_block_stop", "index": 0}) + "\n"))
+
+	closeKiroTextBlock(st, emit)
+	closeKiroToolBlock(st, emit)
 	emit([]byte("event: message_delta\ndata: " + mustJSON(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn", "stop_sequence": nil}, "usage": map[string]any{"output_tokens": 0}}) + "\n"))
 	emit([]byte("event: message_stop\ndata: " + mustJSON(map[string]any{"type": "message_stop"}) + "\n"))
-	_ = ctx
+}
+
+func openKiroTextBlock(st *kiroStreamState, emit func([]byte) bool) {
+	if st.textOpened {
+		return
+	}
+	st.textOpened = true
+	emit([]byte("event: content_block_start\ndata: " + mustJSON(map[string]any{"type": "content_block_start", "index": st.blockIndex, "content_block": map[string]any{"type": "text", "text": ""}}) + "\n"))
+}
+
+func closeKiroTextBlock(st *kiroStreamState, emit func([]byte) bool) {
+	if !st.textOpened {
+		return
+	}
+	st.textOpened = false
+	emit([]byte("event: content_block_stop\ndata: " + mustJSON(map[string]any{"type": "content_block_stop", "index": st.blockIndex}) + "\n"))
+	st.blockIndex++
+}
+
+func openKiroToolBlock(st *kiroStreamState, emit func([]byte) bool, name, toolUseID string, input any) {
+	if st.toolOpened {
+		closeKiroToolBlock(st, emit)
+	}
+	st.toolOpened = true
+	st.toolBlockIdx = st.blockIndex
+	emit([]byte("event: content_block_start\ndata: " + mustJSON(map[string]any{"type": "content_block_start", "index": st.blockIndex, "content_block": map[string]any{"type": "tool_use", "id": toolUseID, "name": name, "input": input}}) + "\n"))
+}
+
+func closeKiroToolBlock(st *kiroStreamState, emit func([]byte) bool) {
+	if !st.toolOpened {
+		return
+	}
+	st.toolOpened = false
+	emit([]byte("event: content_block_stop\ndata: " + mustJSON(map[string]any{"type": "content_block_stop", "index": st.toolBlockIdx}) + "\n"))
+	st.blockIndex++
+	st.toolBlockIdx = -1
+}
+
+func parseKiroStreamChunk(data []byte, st *kiroStreamState, emit func([]byte) bool) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	txt := string(data)
+	searchStart := 0
+	lastConsumed := 0
+
+	for {
+		jsonStart := strings.Index(txt[searchStart:], "{")
+		if jsonStart < 0 {
+			break
+		}
+		jsonStart += searchStart
+
+		braceCount := 0
+		jsonEnd := -1
+		inString := false
+		escapeNext := false
+
+		for i := jsonStart; i < len(txt); i++ {
+			ch := txt[i]
+			if escapeNext {
+				escapeNext = false
+				continue
+			}
+			if ch == '\\' {
+				escapeNext = true
+				continue
+			}
+			if ch == '"' {
+				inString = !inString
+				continue
+			}
+			if !inString {
+				if ch == '{' {
+					braceCount++
+				} else if ch == '}' {
+					braceCount--
+					if braceCount == 0 {
+						jsonEnd = i
+						break
+					}
+				}
+			}
+		}
+
+		if jsonEnd < 0 {
+			lastConsumed = jsonStart
+			searchStart = jsonStart
+			break
+		}
+
+		raw := txt[jsonStart : jsonEnd+1]
+		lastConsumed = jsonEnd + 1
+		searchStart = jsonEnd + 1
+
+		var ev kiroStreamEvent
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			continue
+		}
+
+		if ev.Content != nil && *ev.Content != "" {
+			openKiroTextBlock(st, emit)
+			if !emit([]byte("event: content_block_delta\ndata: " + mustJSON(map[string]any{"type": "content_block_delta", "index": st.blockIndex, "delta": map[string]any{"type": "text_delta", "text": *ev.Content}}) + "\n")) {
+				return nil
+			}
+		} else if ev.Name != nil && ev.ToolUseID != nil {
+			openKiroToolBlock(st, emit, *ev.Name, *ev.ToolUseID, normalizeKiroInput(ev.Input))
+		} else if ev.Stop != nil && *ev.Stop {
+			closeKiroToolBlock(st, emit)
+		}
+	}
+
+	if lastConsumed >= len(txt) {
+		return nil
+	}
+	return []byte(txt[lastConsumed:])
+}
+
+func normalizeKiroInput(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return map[string]any{}
+	}
+	var out any
+	if err := json.Unmarshal(raw, &out); err == nil {
+		return out
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if len(trimmed) < 256 {
+		return strings.TrimRight(trimmed, "\"")
+	}
+	return map[string]any{"text": trimmed}
 }
 
 func parseKiroContentAndTools(data []byte) (string, []kiroToolUse) {

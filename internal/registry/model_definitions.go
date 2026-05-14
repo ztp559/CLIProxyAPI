@@ -155,11 +155,18 @@ func cloneModelInfos(models []*ModelInfo) []*ModelInfo {
 	return out
 }
 
+// GetKiroModels returns the standard Kiro (Amazon Q) model definitions.
+// Kiro reuses Claude model identifiers for compatibility.
+func GetKiroModels() []*ModelInfo {
+	return cloneModelInfos(getModels().Claude)
+}
+
 // GetStaticModelDefinitionsByChannel returns static model definitions for a given channel/provider.
 // It returns nil when the channel is unknown.
 //
 // Supported channels:
 //   - claude
+//   - kiro
 //   - gemini
 //   - vertex
 //   - gemini-cli
@@ -172,6 +179,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 	switch key {
 	case "claude":
 		return GetClaudeModels()
+	case "kiro", "claude-kiro-oauth":
+		return GetKiroModels()
 	case "gemini":
 		return GetGeminiModels()
 	case "vertex":
