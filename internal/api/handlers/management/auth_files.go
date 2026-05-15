@@ -2281,8 +2281,6 @@ func (h *Handler) RequestKiroToken(c *gin.Context) {
 			"auth_method":     "social",
 			"social_provider": socialProvider,
 			"region":          region,
-			"access_token":    storage.AccessToken,
-			"refresh_token":   storage.RefreshToken,
 			"expires_at":      storage.ExpiresAt,
 		}
 		if storage.ProfileARN != "" {
