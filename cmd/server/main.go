@@ -68,6 +68,8 @@ func main() {
 	var oauthCallbackPort int
 	var antigravityLogin bool
 	var kimiLogin bool
+	var kiroLogin bool
+	var kiroAuthMethod string
 	var projectID string
 	var vertexImport string
 	var vertexImportPrefix string
@@ -88,6 +90,8 @@ func main() {
 	flag.IntVar(&oauthCallbackPort, "oauth-callback-port", 0, "Override OAuth callback port (defaults to provider-specific port)")
 	flag.BoolVar(&antigravityLogin, "antigravity-login", false, "Login to Antigravity using OAuth")
 	flag.BoolVar(&kimiLogin, "kimi-login", false, "Login to Kimi using OAuth")
+	flag.BoolVar(&kiroLogin, "kiro-login", false, "Login to Kiro using OAuth (Google/GitHub)")
+	flag.StringVar(&kiroAuthMethod, "kiro-method", "google", "Kiro auth method: google or github")
 	flag.StringVar(&projectID, "project_id", "", "Project ID (Gemini only, not required)")
 	flag.StringVar(&configPath, "config", DefaultConfigPath, "Configure File Path")
 	flag.StringVar(&vertexImport, "vertex-import", "", "Import Vertex service account key JSON file")
@@ -554,6 +558,10 @@ func main() {
 		cmd.DoClaudeLogin(cfg, options)
 	} else if kimiLogin {
 		cmd.DoKimiLogin(cfg, options)
+	} else if kiroLogin {
+		// Handle Kiro login
+		options.AuthMethod = kiroAuthMethod
+		cmd.DoKiroLogin(cfg, options)
 	} else {
 		// In cloud deploy mode without config file, just wait for shutdown signals
 		if isCloudDeploy && !configFileExists {

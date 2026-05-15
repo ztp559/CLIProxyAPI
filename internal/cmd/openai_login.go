@@ -24,6 +24,13 @@ type LoginOptions struct {
 
 	// Prompt allows the caller to provide interactive input when needed.
 	Prompt func(prompt string) (string, error)
+
+	// AuthMethod specifies the social login provider (e.g. "google", "github").
+	// Used by Kiro OAuth flow.
+	AuthMethod string
+
+	// Region specifies the AWS region for Kiro authentication (default: us-east-1).
+	Region string
 }
 
 // DoCodexLogin triggers the Codex OAuth flow through the shared authentication manager.

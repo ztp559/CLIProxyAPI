@@ -27,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/gemini"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kimi"
+	kiroAuth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -2176,6 +2177,142 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 		fmt.Println("You can now use Kimi services through this CLI")
 		CompleteOAuthSession(state)
 		CompleteOAuthSessionsByProvider("kimi")
+	}()
+
+	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+// RequestKiroToken initiates the Kiro OAuth flow via the management API.
+// It generates a PKCE challenge, starts a local callback server, builds the
+// authorization URL, and waits for the callback in a background goroutine.
+func (h *Handler) RequestKiroToken(c *gin.Context) {
+	ctx := context.Background()
+	ctx = PopulateAuthContext(ctx, c)
+
+	// Parse optional request body for auth method and region
+	var body struct {
+		Method string `json:"method"`
+		Region string `json:"region"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	method := strings.TrimSpace(body.Method)
+	if method == "" {
+		method = "google"
+	}
+	region := strings.TrimSpace(body.Region)
+	if region == "" {
+		region = kiroAuth.DefaultRegion
+	}
+
+	idp, socialProvider, err := kiroAuth.NormalizeSocialProvider(method)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	pkce, err := kiroAuth.GeneratePKCECodes()
+	if err != nil {
+		log.Errorf("Failed to generate PKCE codes: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE codes"})
+		return
+	}
+
+	state, err := misc.GenerateRandomState()
+	if err != nil {
+		log.Errorf("Failed to generate state: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state"})
+		return
+	}
+
+	const kiroCallbackPort = 19876
+	oauthServer := kiroAuth.NewOAuthServer(kiroCallbackPort)
+	if err = oauthServer.Start(); err != nil {
+		log.Errorf("Failed to start Kiro callback server: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
+		return
+	}
+
+	redirectURI := oauthServer.RedirectURI()
+	authURL, err := kiroAuth.BuildAuthURL(region, idp, redirectURI, state, pkce)
+	if err != nil {
+		_ = oauthServer.Stop(context.Background())
+		log.Errorf("Failed to build auth URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build authorization url"})
+		return
+	}
+
+	RegisterOAuthSession(state, "kiro")
+
+	go func() {
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = oauthServer.Stop(stopCtx)
+		}()
+
+		result, errWait := oauthServer.WaitForCallback(10 * time.Minute)
+		if errWait != nil {
+			SetOAuthSessionError(state, "Timeout waiting for OAuth callback")
+			log.Errorf("Kiro OAuth callback timeout: %v", errWait)
+			return
+		}
+		if result.Error != "" {
+			SetOAuthSessionError(state, result.Error)
+			log.Errorf("Kiro OAuth callback error: %s", result.Error)
+			return
+		}
+		if result.State != state {
+			SetOAuthSessionError(state, "State mismatch")
+			log.Error("Kiro OAuth state mismatch")
+			return
+		}
+
+		storage, errExchange := kiroAuth.ExchangeCode(ctx, h.cfg, "", region, result.Code, redirectURI, pkce, socialProvider)
+		if errExchange != nil {
+			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
+			log.Errorf("Kiro token exchange failed: %v", errExchange)
+			return
+		}
+
+		fileName := fmt.Sprintf("kiro-%s-%d.json", socialProvider, time.Now().Unix())
+		metadata := map[string]any{
+			"type":            kiroAuth.ProviderKey,
+			"auth_method":     "social",
+			"social_provider": socialProvider,
+			"region":          region,
+			"access_token":    storage.AccessToken,
+			"refresh_token":   storage.RefreshToken,
+			"expires_at":      storage.ExpiresAt,
+		}
+		if storage.ProfileARN != "" {
+			metadata["profile_arn"] = storage.ProfileARN
+		}
+
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: kiroAuth.ProviderKey,
+			FileName: fileName,
+			Storage:  storage,
+			Metadata: metadata,
+			Attributes: map[string]string{
+				"auth_method":     "social",
+				"social_provider": socialProvider,
+				"region":          region,
+			},
+			Status: coreauth.StatusActive,
+		}
+
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save Kiro authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Kiro authentication successful! Token saved to %s\n", savedPath)
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kiro")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
