@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	kiroauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -262,8 +263,98 @@ func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth) 
 		token, errToken := h.refreshAntigravityOAuthAccessToken(ctx, auth)
 		return token, errToken
 	}
+	if provider == "kiro" || provider == "claude-kiro-oauth" || provider == "kiro-oauth" {
+		token, errToken := h.refreshKiroOAuthAccessToken(ctx, auth)
+		return token, errToken
+	}
 
 	return tokenValueForAuth(auth), nil
+}
+
+func (h *Handler) refreshKiroOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if auth == nil {
+		return "", nil
+	}
+	metadata := auth.Metadata
+	if len(metadata) == 0 {
+		return "", fmt.Errorf("kiro oauth metadata missing")
+	}
+
+	current := strings.TrimSpace(tokenValueFromMetadata(metadata))
+	if current != "" && !kiroTokenNeedsRefresh(metadata) {
+		return current, nil
+	}
+
+	refreshToken := stringValueAny(metadata, "refresh_token", "refreshToken")
+	if refreshToken == "" {
+		return "", fmt.Errorf("kiro refresh token missing")
+	}
+	region := stringValueAny(metadata, "region")
+	if region == "" {
+		region = kiroauth.DefaultRegion
+	}
+
+	proxyURL := authProxyURL(auth)
+	updated, errRefresh := kiroauth.RefreshToken(ctx, h.cfg, proxyURL, refreshToken, region)
+	if errRefresh != nil {
+		return "", errRefresh
+	}
+	if updated == nil || strings.TrimSpace(updated.AccessToken) == "" {
+		return "", fmt.Errorf("kiro refresh returned empty access token")
+	}
+
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	now := time.Now()
+	auth.Metadata["access_token"] = strings.TrimSpace(updated.AccessToken)
+	auth.Metadata["accessToken"] = strings.TrimSpace(updated.AccessToken)
+	if strings.TrimSpace(updated.RefreshToken) != "" {
+		auth.Metadata["refresh_token"] = strings.TrimSpace(updated.RefreshToken)
+		auth.Metadata["refreshToken"] = strings.TrimSpace(updated.RefreshToken)
+	}
+	if strings.TrimSpace(updated.ProfileARN) != "" {
+		auth.Metadata["profile_arn"] = strings.TrimSpace(updated.ProfileARN)
+		auth.Metadata["profileArn"] = strings.TrimSpace(updated.ProfileARN)
+	}
+	if strings.TrimSpace(updated.ExpiresAt) != "" {
+		auth.Metadata["expires_at"] = strings.TrimSpace(updated.ExpiresAt)
+		auth.Metadata["expiresAt"] = strings.TrimSpace(updated.ExpiresAt)
+	}
+	if strings.TrimSpace(updated.AuthMethod) != "" {
+		auth.Metadata["auth_method"] = strings.TrimSpace(updated.AuthMethod)
+		auth.Metadata["authMethod"] = strings.TrimSpace(updated.AuthMethod)
+	}
+	if strings.TrimSpace(updated.Region) != "" {
+		auth.Metadata["region"] = strings.TrimSpace(updated.Region)
+	}
+	auth.Metadata["type"] = kiroauth.ProviderKey
+
+	if h != nil && h.authManager != nil {
+		auth.LastRefreshedAt = now
+		auth.UpdatedAt = now
+		_, _ = h.authManager.Update(ctx, auth)
+	}
+
+	return strings.TrimSpace(updated.AccessToken), nil
+}
+
+func kiroTokenNeedsRefresh(metadata map[string]any) bool {
+	const skew = 30 * time.Second
+	if metadata == nil {
+		return true
+	}
+	for _, key := range []string{"expires_at", "expiresAt", "expired", "expiry"} {
+		if expStr, ok := metadata[key].(string); ok {
+			if ts, errParse := time.Parse(time.RFC3339, strings.TrimSpace(expStr)); errParse == nil {
+				return !ts.After(time.Now().Add(skew))
+			}
+		}
+	}
+	return false
 }
 
 func (h *Handler) refreshGeminiOAuthAccessToken(ctx context.Context, auth *coreauth.Auth) (string, error) {
@@ -510,11 +601,22 @@ func geminiOAuthMetadata(auth *coreauth.Auth) (map[string]any, func(map[string]a
 }
 
 func stringValue(metadata map[string]any, key string) string {
-	if len(metadata) == 0 || key == "" {
+	return stringValueAny(metadata, key)
+}
+
+func stringValueAny(metadata map[string]any, keys ...string) string {
+	if len(metadata) == 0 {
 		return ""
 	}
-	if v, ok := metadata[key].(string); ok {
-		return strings.TrimSpace(v)
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if v, ok := metadata[key].(string); ok {
+			if out := strings.TrimSpace(v); out != "" {
+				return out
+			}
+		}
 	}
 	return ""
 }
@@ -631,16 +733,27 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 	return nil
 }
 
+func authProxyURL(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
+		return proxyStr
+	}
+	if len(auth.Metadata) > 0 {
+		return stringValueAny(auth.Metadata, "proxy_url", "proxyUrl", "proxy")
+	}
+	return ""
+}
+
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
 	var proxyCandidates []string
-	if auth != nil {
-		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
+	if authProxy := authProxyURL(auth); authProxy != "" {
+		proxyCandidates = append(proxyCandidates, authProxy)
+	}
+	if auth != nil && h != nil && h.cfg != nil {
+		if proxyStr := strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth)); proxyStr != "" {
 			proxyCandidates = append(proxyCandidates, proxyStr)
-		}
-		if h != nil && h.cfg != nil {
-			if proxyStr := strings.TrimSpace(proxyURLFromAPIKeyConfig(h.cfg, auth)); proxyStr != "" {
-				proxyCandidates = append(proxyCandidates, proxyStr)
-			}
 		}
 	}
 	if h != nil && h.cfg != nil {
