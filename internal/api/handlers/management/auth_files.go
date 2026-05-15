@@ -997,10 +997,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("invalid auth file: %w", err)
 	}
-	provider, _ := metadata["type"].(string)
-	if provider == "" {
-		provider = "unknown"
-	}
+	provider := providerFromAuthMetadata(metadata)
 	label := provider
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		label = email
@@ -1041,6 +1038,36 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
+}
+
+func providerFromAuthMetadata(metadata map[string]any) string {
+	provider := stringMetadataValue(metadata, "type", "provider", "auth_provider")
+	if provider == "" {
+		return "unknown"
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "claude-kiro-oauth" || provider == "kiro-oauth" {
+		provider = "kiro"
+	}
+	if provider == "kiro" {
+		metadata["type"] = "kiro"
+		metadata["provider"] = "kiro"
+		if stringMetadataValue(metadata, "region") == "" {
+			metadata["region"] = "us-east-1"
+		}
+	}
+	return provider
+}
+
+func stringMetadataValue(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {

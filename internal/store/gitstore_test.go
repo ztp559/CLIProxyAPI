@@ -19,6 +19,45 @@ type testBranchSpec struct {
 	contents string
 }
 
+func TestReadAuthFile_RecognizesKiroFromTypeOrProvider(t *testing.T) {
+	baseDir := t.TempDir()
+	store := NewGitTokenStore("", "", "", "")
+	store.SetBaseDir(baseDir)
+
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{name: "type-only.json", content: `{"type":"kiro","refresh_token":"refresh"}`},
+		{name: "provider-only.json", content: `{"provider":"kiro","refresh_token":"refresh"}`},
+		{name: "legacy-provider.json", content: `{"provider":"kiro-oauth","refresh_token":"refresh"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(baseDir, tc.name)
+			if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+				t.Fatalf("write auth file: %v", err)
+			}
+			auth, err := store.readAuthFile(path, baseDir)
+			if err != nil {
+				t.Fatalf("readAuthFile: %v", err)
+			}
+			if auth.Provider != "kiro" {
+				t.Fatalf("expected provider kiro, got %q", auth.Provider)
+			}
+			if got := auth.Metadata["type"]; got != "kiro" {
+				t.Fatalf("expected metadata type kiro, got %#v", got)
+			}
+			if got := auth.Metadata["provider"]; got != "kiro" {
+				t.Fatalf("expected metadata provider kiro, got %#v", got)
+			}
+			if got := auth.Metadata["region"]; got != "us-east-1" {
+				t.Fatalf("expected default region us-east-1, got %#v", got)
+			}
+		})
+	}
+}
+
 func TestEnsureRepositoryUsesRemoteDefaultBranchWhenBranchNotConfigured(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "trunk",

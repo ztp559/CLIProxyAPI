@@ -471,10 +471,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
-	provider, _ := metadata["type"].(string)
-	if provider == "" {
-		provider = "unknown"
-	}
+	provider := providerFromAuthMetadata(metadata)
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat file: %w", err)
@@ -498,6 +495,36 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 	}
 	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
+}
+
+func providerFromAuthMetadata(metadata map[string]any) string {
+	provider := stringMetadataValue(metadata, "type", "provider", "auth_provider")
+	if provider == "" {
+		return "unknown"
+	}
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "claude-kiro-oauth" || provider == "kiro-oauth" {
+		provider = "kiro"
+	}
+	if provider == "kiro" {
+		metadata["type"] = "kiro"
+		metadata["provider"] = "kiro"
+		if stringMetadataValue(metadata, "region") == "" {
+			metadata["region"] = "us-east-1"
+		}
+	}
+	return provider
+}
+
+func stringMetadataValue(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := metadata[key].(string); ok {
+			if trimmed := strings.TrimSpace(value); trimmed != "" {
+				return trimmed
+			}
+		}
+	}
+	return ""
 }
 
 func (s *GitTokenStore) idFor(path, baseDir string) string {
